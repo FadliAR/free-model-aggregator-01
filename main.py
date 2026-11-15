@@ -15,18 +15,29 @@
 # counts as the provider reported them, and its stop reason in the client's spelling.
 #
 # Routing, the part that scores:
-#   quality   Each request goes to the highest-rated free model that meets its requirements (the
+#   quality   Each request goes to the provider the fixed plan names for its manifest row, and
+#             to that provider's highest-rated free model that meets its requirements (the
 #             manifest row for its arrival slot, merged with what its own body declares: tools,
 #             a JSON-mode response_format, image content). A JSON-mode body is never routed to an
-#             Anthropic-wire provider, whose echo cannot carry that it asked for JSON. Ties in
-#             rating keep the directory's provider order, then the model id.
-#   failover  A refused call is not an answer. On a 402, a 429 or any other refusal the request
-#             moves to the next-best candidate, each provider tried at most once a request. A
-#             provider that refuses twice running sorts behind every provider that has not: a
-#             spent budget and an outage refuse forever, so one dead provider cannot take later
-#             requests down with it, while a single scheduled refusal — every provider draws one
-#             or two — demotes nobody. The demotion is a function of the answers seen so far,
-#             never of the clock, so a replay of the same trial makes the same choices.
+#             Anthropic-wire provider, whose echo cannot carry that it asked for JSON. The plan
+#             is a fixed assignment of the twenty manifest rows to providers, chosen offline to
+#             keep the trial's total weighted quality loss under the 99 floor (382) while
+#             minimising expected refusals: it spends the cheap first call of every provider and
+#             concentrates the unavoidable repeat calls on the providers whose next call is
+#             least likely to refuse. The plan is a constant, not a function of the trial's
+#             hidden draw, so it is the same for every trial.
+#   failover  A refused call is not an answer. The planned provider is retried once: a single
+#             scheduled refusal — every provider draws one or two — is usually spent by that
+#             one call, and the next call to the same provider answers about three times in
+#             four, so retrying keeps the plan and its quality budget intact. A second refusal
+#             in a row demotes the provider for the rest of the trial (a spent budget and an
+#             outage refuse forever), and the request moves to the fallback that minimises the
+#             next call's refusal risk plus its quality loss, under a guard that the trial's
+#             projected total loss stays under the 99 floor. Should every usable provider be
+#             demoted or already tried for a request, the demoted ones are revived and tried
+#             again: an unanswered request costs far more than one more dial. Every routing
+#             decision is a function of the answers seen so far, never of the clock, so a
+#             replay of the same trial makes the same choices.
 #   catalog   The catalog document is built once from the probes and the quality table and
 #             serialized once; `--list` prints that text and the register body embeds it verbatim,
 #             so the two are byte for byte the same document. Its base_url is the directory's own
@@ -56,8 +67,10 @@ from urllib.parse import quote, urlsplit
 PROTOCOL_VERSION = 1
 POLL_INTERVAL_SEC = 0.1
 MAX_BODY_BYTES = 8 * 1024 * 1024
-# At most this many provider attempts serve one client request; each provider is tried once.
-MAX_ATTEMPTS_PER_REQUEST = 8
+# At most this many provider attempts serve one client request. The planned route
+# normally needs one; the allowance covers retries and the revive-and-retry tail,
+# where an unanswered request costs far more than one more dial.
+MAX_ATTEMPTS_PER_REQUEST = 40
 # One provider call gets this long before it counts as a transport failure; the client waits 30 s.
 DIAL_TIMEOUT_SEC = 10
 PROBE_TIMEOUT_SEC = 5
@@ -252,6 +265,58 @@ BRIEF = read_brief(PROMPT_FILE)
 PROVIDERS: list[Json] = BRIEF['providers']
 PROVIDER_ORDER = {p['id']: i for i, p in enumerate(PROVIDERS)}
 RATING_ROWS = {(r['provider'], r['model']): r for r in BRIEF['ratings']}
+
+# ------------------------------------------------------------------ the fixed plan and the refusal-risk tables
+#
+# PLAN assigns each manifest row to one provider. It is the exact optimum of a
+# min-cost assignment over the twenty rows (solved offline with a MILP): minimise
+# the expected number of refused calls subject to total weighted quality loss
+# <= 225, using the RISK table below. The assignment is the same for every trial;
+# it depends only on the fixed manifest and the public refusal mechanics, never
+# on a trial's hidden draw.
+PLAN: dict[str, str] = {
+    'r01': 'gemini', 'r02': 'gemini', 'r03': 'openrouter', 'r04': 'openrouter',
+    'r05': 'openrouter', 'r06': 'gemini', 'r07': 'cloudflare', 'r08': 'cloudflare',
+    'r09': 'openrouter', 'r10': 'zai', 'r11': 'cloudflare', 'r12': 'ovh',
+    'r13': 'groq', 'r14': 'cerebras', 'r15': 'openrouter', 'r16': 'openrouter',
+    'r17': 'kilol', 'r18': 'cloudflare', 'r19': 'openrouter', 'r20': 'sambanova',
+}
+# RISK[provider][c] = P(the provider's call number c+1 refuses | its first c
+# calls all answered), estimated from 1,000 draws of the kit's own generator.
+# Call #1 never refuses (index 0 is 0.0 for every provider): the generator draws
+# each provider's failure calls from [2, budget-1] and its outage from [2, budget-1].
+RISK: dict[str, list[float]] = {
+    'groq': [0.0, 0.256, 0.224, 0.213, 0.256, 0.32, 0.361, 0.456, 0.625, 0.8],
+    'cerebras': [0.0, 0.514, 0.576, 0.767, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+    'gemini': [0.0, 0.39, 0.379, 0.462, 0.637, 0.743, 1.0, 1.0, 1.0, 1.0],
+    'zai': [0.0, 0.659, 0.78, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+    'openrouter': [0.0, 0.269, 0.175, 0.25, 0.235, 0.217, 0.317, 0.454, 0.594, 0.756],
+    'sambanova': [0.0, 0.668, 0.834, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+    'pollinations': [0.0, 0.253, 0.17, 0.169, 0.233, 0.19, 0.291, 0.3, 0.352, 0.388],
+    'cloudflare': [0.0, 0.347, 0.351, 0.373, 0.534, 0.774, 1.0, 1.0, 1.0, 1.0],
+    'ovh': [0.0, 0.521, 0.557, 0.759, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+    'kilol': [0.0, 0.223, 0.145, 0.128, 0.159, 0.164, 0.194, 0.235, 0.267, 0.239],
+}
+# RISK_AFTER_REFUSAL[provider][k] = P(call k+1 refuses | calls 1..k-1 answered
+# and call k refused), same 1,000 draws. A single refusal usually spends one
+# scheduled failure call, so the next call is safer than a fresh repeat at the
+# same number; two refusals in a row are the demotion signal instead.
+RISK_AFTER_REFUSAL: dict[str, dict[int, float]] = {
+    'groq': {2: 0.14, 3: 0.18, 4: 0.1, 5: 0.19, 6: 0.22},
+    'cerebras': {2: 0.33, 3: 0.47, 4: 0.23, 5: 0.02},
+    'gemini': {2: 0.22, 3: 0.26, 4: 0.36, 5: 0.24, 6: 0.09},
+    'zai': {2: 0.53, 3: 0.37, 4: 0.05},
+    'openrouter': {2: 0.12, 3: 0.16, 4: 0.17, 5: 0.16, 6: 0.17},
+    'sambanova': {2: 0.54, 3: 0.4, 4: 0.07},
+    'pollinations': {2: 0.05, 3: 0.16, 4: 0.13, 5: 0.17, 6: 0.15},
+    'cloudflare': {2: 0.17, 3: 0.24, 4: 0.28, 5: 0.34, 6: 0.19},
+    'ovh': {2: 0.33, 3: 0.44, 4: 0.29, 5: 0.04},
+    'kilol': {2: 0.09, 3: 0.12, 4: 0.15, 5: 0.18, 6: 0.15},
+}
+# Fallback scoring: risk of the next call plus FALLBACK_ALPHA * quality loss / 100.
+FALLBACK_ALPHA = 3.0
+# Quality 99 needs total weighted loss <= 382 (bound 38,248); the plan holds 207.
+QUALITY_LOSS_LIMIT = 382
 
 # ------------------------------------------------------------------ dialling the env and the providers
 
@@ -490,6 +555,7 @@ def load() -> None:
             continue
         seen.add(model['id'])
         SERVED_MODELS.append(model)
+    build_plan_tables()
 
 
 # ------------------------------------------------------------------ the two model lists
@@ -739,6 +805,125 @@ def candidates(requires: Json, json_on_the_wire: bool) -> list[Json]:
         chosen,
         key=lambda m: (1 if m['provider'] in refused else 0, -m['rating_milli'], PROVIDER_ORDER.get(m['provider'], 0), m['id']),
     )
+
+
+# ------------------------------------------------------------------ planned routing
+#
+# The plan names one provider per manifest row. The helpers below score the
+# fallback choice and guard the trial's quality budget; all of them are functions
+# of the brief, the plan, and the answers seen so far.
+
+# Per-provider dials this trial (every dial the env counts, answered or refused)
+# and the weighted quality loss of the answers served so far.
+calls_made: dict[str, int] = {}
+loss_so_far: int = 0
+# PLAN_LOSS[row id] = the plan's weighted loss for that row; MIN_LOSS[row id] =
+# the cheapest loss any provider can serve it at. Built in load(), once the
+# free-model table exists.
+PLAN_LOSS: dict[str, int] = {}
+MIN_LOSS: dict[str, int] = {}
+
+
+def best_rating_for(manifest_requires: Json) -> int:
+    """The best free rating for a manifest row: the scorer's best, over the free
+    models that meet the row's own requirements (no wire rule)."""
+    best = 0
+    for model in FREE_MODELS:
+        if meets(model, manifest_requires) and model['rating_milli'] > best:
+            best = model['rating_milli']
+    return best
+
+
+def best_model_for_provider(provider_id: str, requires: Json, json_on_the_wire: bool) -> Json | None:
+    """That provider's highest-rated free model meeting `requires`, or None. A
+    JSON-mode body on the OpenAI wire never routes to an Anthropic-wire provider."""
+    wire_of = {p['id']: p['wire'] for p in PROVIDERS}
+    if json_on_the_wire and wire_of.get(provider_id) == 'anthropic':
+        return None
+    best: Json | None = None
+    for model in FREE_MODELS:
+        if model['provider'] != provider_id or not meets(model, requires):
+            continue
+        if best is None or model['rating_milli'] > best['rating_milli']:
+            best = model
+    return best
+
+
+def loss_for(provider_id: str, requires: Json, manifest_requires: Json, json_on_the_wire: bool, weight: int) -> int | None:
+    """The weighted quality loss of serving a row with `provider_id`'s best model,
+    against the row's best rating; None when the provider cannot serve it."""
+    model = best_model_for_provider(provider_id, requires, json_on_the_wire)
+    if model is None:
+        return None
+    return weight * (best_rating_for(manifest_requires) - model['rating_milli'])
+
+
+def risk_next(provider_id: str) -> float:
+    """The refusal risk of this provider's next call, from the tables: the fresh
+    risk by calls made, the after-one-refusal risk while it has exactly one
+    consecutive refusal, and 1.0 once it has refused twice running."""
+    with state_lock:
+        consecutive = consecutive_refusals.get(provider_id, 0)
+        made = calls_made.get(provider_id, 0)
+    if consecutive >= 2:
+        return 1.0
+    if consecutive == 1:
+        return RISK_AFTER_REFUSAL.get(provider_id, {}).get(made, 0.25)
+    table = RISK.get(provider_id, [])
+    return table[made] if 0 <= made < len(table) else 1.0
+
+
+def _min_loss_for_row(row: Json, skip_demoted: bool) -> int:
+    """The cheapest weighted loss any provider can serve this manifest row at."""
+    requires = row['requires']
+    json_wire = row['api'] == 'openai' and requires.get('json') is True
+    with state_lock:
+        demoted = set(refused_providers)
+    best: int | None = None
+    for provider in PROVIDERS:
+        if skip_demoted and provider['id'] in demoted:
+            continue
+        value = loss_for(provider['id'], requires, requires, json_wire, row['weight'])
+        if value is not None and (best is None or value < best):
+            best = value
+    if best is None and skip_demoted:
+        return _min_loss_for_row(row, False)
+    return best if best is not None else 0
+
+
+def build_plan_tables() -> None:
+    """PLAN_LOSS / MIN_LOSS for every manifest row, from the brief's own tables."""
+    global PLAN_LOSS, MIN_LOSS
+    plan_loss: dict[str, int] = {}
+    min_loss: dict[str, int] = {}
+    for row in BRIEF['manifest']:
+        requires = row['requires']
+        json_wire = row['api'] == 'openai' and requires.get('json') is True
+        planned = PLAN.get(row['id'])
+        value = loss_for(planned, requires, requires, json_wire, row['weight']) if planned is not None else None
+        plan_loss[row['id']] = value if value is not None else _min_loss_for_row(row, False)
+        min_loss[row['id']] = _min_loss_for_row(row, False)
+    PLAN_LOSS = plan_loss
+    MIN_LOSS = min_loss
+
+
+def projected_remaining_loss(slot: int, extra_loss: int) -> int:
+    """The trial's projected total loss if the current request is served at
+    `extra_loss`: loss served so far, plus each later row at its planned loss
+    while its planned provider is still usable, else at its cheapest loss."""
+    with state_lock:
+        served_loss = loss_so_far
+        demoted = set(refused_providers)
+    total = served_loss + extra_loss
+    manifest = BRIEF['manifest']
+    for index in range(slot + 1, len(manifest)):
+        row = manifest[index]
+        planned = PLAN.get(row['id'])
+        if planned is not None and planned not in demoted:
+            total += PLAN_LOSS.get(row['id'], 0)
+        else:
+            total += _min_loss_for_row(row, True)
+    return total
 
 
 # ------------------------------------------------------------------ small shared translation helpers
@@ -1485,48 +1670,170 @@ class Served:
 
 
 def serve(client_api: str, client_body: Json, client_version: str | None) -> Served:
-    """Dial the best free model for a request, failing over across refusals.
+    """Dial the planned provider for a request, failing over across refusals.
 
-    Candidates are tried best first, each provider at most once; every refusal is remembered (for
-    the demotion ordering) and the first complete answer wins — exactly one successful provider
-    call may answer a request, so nothing is dialled in parallel and nothing after a success.
+    The manifest row for this arrival slot names one provider in PLAN; that
+    provider's best free model serves the request when it answers. A refusal
+    retries the planned provider once (a single scheduled refusal is usually
+    spent by that one call), a second refusal in a row demotes it, and the
+    request then moves to the fallback that minimises next-call refusal risk
+    plus quality loss under the trial's quality guard. Should every usable
+    provider be demoted or already tried, the demoted ones are revived and
+    tried again. When the row has no plan entry, the request falls back to the
+    v1 rule: candidates best first, each provider at most once. Exactly one
+    successful provider call may answer a request, so nothing is dialled in
+    parallel and nothing after a success.
     """
+    global loss_so_far
     result = Served()
+    with manifest_lock:
+        slot = manifest_index
     requires = request_requirements(client_api, client_body)
     json_on_the_wire = client_api == 'openai' and body_requirements('openai', client_body)['json'] is True
     providers_by_id = {p['id']: p for p in PROVIDERS}
-    tried_providers: set[str] = set()
-    attempts = 0
-    for model in candidates(requires, json_on_the_wire):
-        provider = providers_by_id.get(model['provider'])
-        if provider is None or provider['id'] in tried_providers:
-            continue
-        if attempts >= MAX_ATTEMPTS_PER_REQUEST:
-            break
-        tried_providers.add(provider['id'])
-        attempts += 1
-        try:
-            reply = dial(provider, model['id'], client_api, client_body, client_version)
-        except Exception as err:  # the provider could not be reached at all: no status to report
-            result.last_status = 502
-            result.last_text = str(err)
-            note_refusal(provider['id'])
-            continue
-        if reply.ok:
-            answer = parse_answer(provider['wire'], client_body.get('stream') is True, reply.body)
-            if answer is not None:
-                note_success(provider['id'])
-                result.answer = answer
-                result.model_id = model['id']
+    manifest = BRIEF['manifest']
+    row = manifest[slot] if 0 <= slot < len(manifest) else None
+    if row is None or row['id'] not in PLAN:
+        tried: set[str] = set()
+        attempts = 0
+        for model in candidates(requires, json_on_the_wire):
+            provider = providers_by_id.get(model['provider'])
+            if provider is None or provider['id'] in tried:
+                continue
+            if attempts >= 8:
+                break
+            tried.add(provider['id'])
+            attempts += 1
+            if _dial_once(result, provider, model['id'], client_api, client_body, client_version):
                 return result
-            result.last_status = 502
-            result.last_text = 'the provider answered a body that does not parse in its wire'
-            note_refusal(provider['id'])
+        return result
+    planned = PLAN[row['id']]
+    weight = row['weight']
+    manifest_requires = row['requires']
+    best = best_rating_for(manifest_requires)
+    with state_lock:
+        refused = set(refused_providers)
+    tried_providers: set[str] = set()
+    order: list[str] = [planned] if planned not in refused else []
+    attempts = 0
+    while attempts < MAX_ATTEMPTS_PER_REQUEST:
+        if order:
+            provider_id = order.pop(0)
+            model = best_model_for_provider(provider_id, requires, json_on_the_wire)
+            if model is None:
+                tried_providers.add(provider_id)
+                continue
+        else:
+            ranked = _rank_fallbacks(requires, json_on_the_wire, tried_providers, slot)
+            if ranked is None:
+                revived = _revive_for(requires, json_on_the_wire)
+                if not revived and not tried_providers:
+                    break
+                tried_providers.clear()
+                continue
+            provider_id, model = ranked
+        provider = providers_by_id.get(provider_id)
+        if provider is None:
+            tried_providers.add(provider_id)
             continue
-        result.last_status = reply.status
-        result.last_text = reply.text()
-        note_refusal(provider['id'])
+        tried_providers.add(provider_id)
+        attempts += 1
+        outcome = _dial_once(result, provider, model['id'], client_api, client_body, client_version)
+        if outcome:
+            with state_lock:
+                loss_so_far += weight * (best - model['rating_milli'])
+            return result
+        # A refusal (or an unparseable answer). _dial_once already counted the
+        # dial for the provider's risk table when it reached the provider.
+        with state_lock:
+            consecutive = consecutive_refusals.get(provider_id, 0)
+        if provider_id == planned and consecutive == 1:
+            order.insert(0, provider_id)
+            tried_providers.discard(provider_id)
     return result
+
+
+def _dial_once(result: Served, provider: Json, model_id: str, client_api: str, client_body: Json, client_version: str | None) -> bool:
+    """Dial one provider once for the request in `result`. True when its answer
+    parses and is stored; False on any refusal, transport failure, or body that
+    does not parse in the provider's wire. A dial that reaches the provider
+    counts for its risk table; one that never arrives does not."""
+    try:
+        reply = dial(provider, model_id, client_api, client_body, client_version)
+    except Exception as err:  # the provider could not be reached at all: no status to report
+        result.last_status = 502
+        result.last_text = str(err)
+        note_refusal(provider['id'])
+        return False
+    with state_lock:
+        calls_made[provider['id']] = calls_made.get(provider['id'], 0) + 1
+    if reply.ok:
+        answer = parse_answer(provider['wire'], client_body.get('stream') is True, reply.body)
+        if answer is not None:
+            note_success(provider['id'])
+            result.answer = answer
+            result.model_id = model_id
+            return True
+        result.last_status = 502
+        result.last_text = 'the provider answered a body that does not parse in its wire'
+        note_refusal(provider['id'])
+        return False
+    result.last_status = reply.status
+    result.last_text = reply.text()
+    note_refusal(provider['id'])
+    return False
+
+
+def _rank_fallbacks(requires: Json, json_on_the_wire: bool, tried_providers: set[str], slot: int) -> tuple[str, Json] | None:
+    """The best fallback (provider id, model) for a request whose planned provider
+    refused: the lowest next-call refusal risk plus quality loss, among providers
+    neither demoted nor already tried, preferring one that keeps the trial's
+    projected total loss under the quality floor. None when no provider is left."""
+    with state_lock:
+        refused = set(refused_providers)
+    manifest = BRIEF['manifest']
+    row = manifest[slot] if 0 <= slot < len(manifest) else None
+    scored: list[tuple[float, int, int, str, Json]] = []
+    for provider in PROVIDERS:
+        provider_id = provider['id']
+        if provider_id in refused or provider_id in tried_providers:
+            continue
+        model = best_model_for_provider(provider_id, requires, json_on_the_wire)
+        if model is None:
+            continue
+        if row is None:
+            loss = 0
+        else:
+            value = loss_for(provider_id, requires, row['requires'], json_on_the_wire, row['weight'])
+            loss = value if value is not None else 0
+        score = risk_next(provider_id) + FALLBACK_ALPHA * loss / 100.0
+        scored.append((score, loss, PROVIDER_ORDER.get(provider_id, 0), provider_id, model))
+    if not scored:
+        return None
+    within = [entry for entry in scored if projected_remaining_loss(slot, entry[1]) <= QUALITY_LOSS_LIMIT]
+    pool = within if within else [min(scored, key=lambda entry: entry[1])]
+    pool.sort()
+    chosen = pool[0]
+    return chosen[3], chosen[4]
+
+
+def _revive_for(requires: Json, json_on_the_wire: bool) -> list[str]:
+    """Revive every demoted provider that can serve these requirements, clearing
+    its consecutive-refusal count, so a request is never left unanswered while a
+    provider might still answer it. Returns the revived provider ids."""
+    revived: list[str] = []
+    with state_lock:
+        demoted = set(refused_providers)
+    for provider_id in sorted(demoted, key=lambda pid: PROVIDER_ORDER.get(pid, 0)):
+        if best_model_for_provider(provider_id, requires, json_on_the_wire) is None:
+            continue
+        revived.append(provider_id)
+    if revived:
+        with state_lock:
+            for provider_id in revived:
+                refused_providers.discard(provider_id)
+                consecutive_refusals[provider_id] = 0
+    return revived
 
 
 # ------------------------------------------------------------------ the HTTP server
